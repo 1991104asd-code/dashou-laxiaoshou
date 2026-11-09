@@ -557,7 +557,8 @@ try {
 } catch (e) {}
 
 /* ============ 内容数据 ============ */
-const ADULTS = [['👩', '妈妈'], ['👨', '爸爸'], ['👵', '奶奶'], ['👴', '爷爷'], ['👵', '外婆'], ['👴', '外公'], ['🧑', '大朋友']];
+/* @voice-data:start  这一段只放纯数据和台词规则，tools/voice-lines.js 会读取它来生成语音文件 */
+const ADULTS =[['👩', '妈妈'], ['👨', '爸爸'], ['👵', '奶奶'], ['👴', '爷爷'], ['👵', '外婆'], ['👴', '外公'], ['🧑', '大朋友']];
 const KIDS = ['👧', '👦', '🧒', '👶', '🐯', '🐰', '🐼'];
 const AGES = ['3-4岁', '5-6岁', '7岁+'];
 const LEVELS = [
@@ -620,6 +621,36 @@ const CARDS = [
   [4, 0, '🎤', '一起唱一首两个人都会的歌'],
   [4, 0, '🐒', '学小猴子挠挠痒，再学小猫伸个大懒腰']
 ];
+// 语音台词。音频是提前生成好的，所以小朋友在语音里统一叫"宝贝"，大朋友用所选的称呼（妈妈、爸爸……）
+const VOICE_KID = '宝贝';
+const ROLES = Array.from(new Set(ADULTS.map(a => a[1])));
+const LINES = {
+  target: animal => `看到${animal}，就快拍！`,
+  snapWin: (role, kidWon) => kidWon ? `${VOICE_KID}赢啦，真厉害！` : `${role}赢啦！${VOICE_KID}下次加油！`,
+  memWin: (role, kidWon) => `${kidWon ? VOICE_KID : role}赢啦！`,
+  memFirst: () => `${VOICE_KID}先翻牌！`,
+  card: (c, role) => `${c[1] === 0 ? '一起来' : (c[1] === 1 ? VOICE_KID : role) + '来'}，${c[3].replace(/\{K\}/g, VOICE_KID).replace(/\{A\}/g, role)}`,
+  stickerGet: s => `获得新贴纸：${s[1]}！`,
+  stickerName: s => s[1],
+  tie: '平手！两个人一样棒！', memGood: '记性超级棒！', memDone: '全部找到啦！',
+  bub3: '默契满分！', bub2: '配合得真好！', bub1: '下次一定行！',
+  rest: '眼睛累啦，一起看看窗外最远的地方吧。', timeUp: '时间到！'
+};
+function allVoiceLines() {
+  const set = new Set(['tie', 'memGood', 'memDone', 'bub3', 'bub2', 'bub1', 'rest', 'timeUp'].map(k => LINES[k]));
+  ANIMALS.forEach(a => set.add(LINES.target(a[1])));
+  set.add(LINES.snapWin('', true)); set.add(LINES.memWin('', true)); set.add(LINES.memFirst());
+  ROLES.forEach(r => { set.add(LINES.snapWin(r, false)); set.add(LINES.memWin(r, false)); CARDS.forEach(c => set.add(LINES.card(c, r))); });
+  STICKERS.forEach(s => { set.add(LINES.stickerGet(s)); set.add(LINES.stickerName(s)); });
+  return Array.from(set);
+}
+// 台词 → 文件名（FNV-1a），生成工具和游戏用同一个函数
+function voiceKey(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+/* @voice-data:end */
 const TIPS = [
   '让孩子赢，也让孩子输。输了笑着说一句"下次再来"，比赢更重要。',
   '多夸孩子的努力和办法，少说"你真聪明"。',
@@ -657,14 +688,14 @@ function addStars(n) {
 
 /* ============ 声音、语音、振动 ============ */
 let AC = null;
-function actx() {
-  if (!S.sound) return null;
+function getAC() {
   try {
     if (!AC) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return null; AC = new C(); }
     if (AC.state === 'suspended') AC.resume();
     return AC;
   } catch (e) { return null; }
 }
+const actx = () => (S.sound ? getAC() : null);
 function tone(f, dur, type, vol, when, slide) {
   const a = actx(); if (!a) return;
   try {
@@ -692,7 +723,7 @@ const sfx = {
   big() { [660, 880, 1320].forEach((f, i) => tone(f, 0.16, 'triangle', 0.2, i * 0.07)); },
   win() { [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, 0.22, 'triangle', 0.18, i * 0.11)); }
 };
-document.addEventListener('pointerdown', () => { actx(); }, { capture: true, passive: true });
+document.addEventListener('pointerdown', () => { getAC(); }, { capture: true, passive: true });
 
 const canSpeak = 'speechSynthesis' in window && typeof window.SpeechSynthesisUtterance === 'function';
 let zhVoice = null;
@@ -716,7 +747,56 @@ function say(text, force) {
     ss.speak(u);
   } catch (e) {}
 }
-function hush() { try { canSpeak && window.speechSynthesis.cancel(); } catch (e) {} }
+// 预先生成的语音包（voice/ 文件夹）。打不开时（比如直接双击本地文件）才退回到系统朗读。
+const Voice = (() => {
+  let keys = null, loading = null, cur = null, seq = 0;
+  const cache = new Map();
+  function load() {
+    if (!loading) {
+      loading = fetch('voice/index.json')
+        .then(r => (r.ok ? r.json() : null))
+        .then(j => { keys = j && Array.isArray(j.keys) ? new Set(j.keys) : null; })
+        .catch(() => { keys = null; });
+    }
+    return loading;
+  }
+  function buffer(key) {
+    if (cache.has(key)) return cache.get(key);
+    const ctx = getAC();
+    if (!ctx) return Promise.reject(new Error('no audio'));
+    const p = fetch(`voice/${key}.mp3`)
+      .then(r => { if (!r.ok) throw new Error('missing'); return r.arrayBuffer(); })
+      .then(b => new Promise((res, rej) => ctx.decodeAudioData(b, res, rej)));
+    cache.set(key, p);
+    p.catch(() => cache.delete(key));
+    if (cache.size > 48) cache.delete(cache.keys().next().value);
+    return p;
+  }
+  function stop() { seq++; if (cur) { try { cur.stop(); } catch (e) {} cur = null; } }
+  // text：语音里的台词（用"宝贝"和角色称呼）；fallback：系统朗读时用的真实名字版本
+  async function play(text, fallback, force) {
+    if (!S.voice && !force) return;
+    const token = ++seq;
+    await load();
+    if (token !== seq) return;
+    const key = voiceKey(text);
+    if (!keys || !keys.has(key)) { say(fallback || text, force); return; }
+    try {
+      const buf = await buffer(key);
+      if (token !== seq) return;
+      const ctx = getAC();
+      if (cur) { try { cur.stop(); } catch (e) {} }
+      const src = ctx.createBufferSource();
+      src.buffer = buf; src.connect(ctx.destination); src.start();
+      cur = src; src.onended = () => { if (cur === src) cur = null; };
+    } catch (e) { if (token === seq) say(fallback || text, force); }
+  }
+  function prefetch(texts) {
+    load().then(() => { if (keys && getAC()) texts.forEach(t => { const k = voiceKey(t); if (keys.has(k)) buffer(k).catch(() => {}); }); });
+  }
+  return { load, play, stop, prefetch };
+})();
+function hush() { Voice.stop(); try { canSpeak && window.speechSynthesis.cancel(); } catch (e) {} }
 function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
 
 let wake = null;
@@ -856,7 +936,7 @@ function openSettings() {
   const body = $('#set-body'); body.innerHTML = '';
   body.appendChild(segRow('小朋友几岁', AGES, 'age', renderHome));
   body.appendChild(toggleRow('音效', '拍打、翻牌、戳泡泡的声音', 'sound'));
-  body.appendChild(toggleRow('语音朗读', canSpeak ? (zhVoice ? '读出目标动物和挑战卡' : '这台手机可能没有中文语音包') : '这个浏览器不支持朗读', 'voice', null, !canSpeak));
+  body.appendChild(toggleRow('语音', '读出目标动物、挑战卡和比赛结果', 'voice', v => { if (!v) hush(); }));
   body.appendChild(toggleRow('护眼提醒', '每玩 15 分钟，提醒一起休息 20 秒', 'rest'));
   const reset = document.createElement('button'); reset.className = 'danger'; reset.textContent = '清空星星和贴纸';
   let armed = 0;
@@ -893,7 +973,7 @@ function openIntro(id) {
   const box = $('#in-opts'); box.innerHTML = '';
   if (id === 'snap') box.appendChild(toggleRow('大朋友让一让', `${adultName()}要连拍 2 下才算数`, 'snapHandicap'));
   if (id === 'memory') box.appendChild(segRow('怎么玩', ['比一比', '一起玩'], 'memCoop'));
-  if (id === 'cards' && canSpeak) box.appendChild(toggleRow('抽到卡片自动朗读', zhVoice ? '不认字的小朋友也能玩' : '这台手机可能没有中文语音包', 'voice'));
+  if (id === 'cards') box.appendChild(toggleRow('抽到卡片自动朗读', '不认字的小朋友也能玩', 'voice'));
   box.hidden = !box.children.length;
   openOv('ov-intro');
 }
@@ -942,7 +1022,7 @@ function showResult(o) {
   again = o.again;
   openOv('ov-result');
   sfx.win(); FX.rain(90); buzz([30, 50, 30]);
-  say(o.speak || o.title);
+  Voice.play(o.voice || o.title, o.speak || o.title);
 }
 $('#res-again').addEventListener('click', () => { closeOv('ov-result'); if (restDue()) showRest(() => again && again()); else if (again) again(); });
 $('#res-home').addEventListener('click', () => { closeOv('ov-result'); goHome(); });
@@ -961,7 +1041,7 @@ function showRest(after) {
   const btn = $('#rest-go'), num = $('#rest-num'), ring = $('#rest-ring');
   btn.disabled = true; btn.textContent = '休息中…'; num.textContent = left; ring.style.setProperty('--p', 0);
   openOv('ov-rest');
-  say('眼睛累啦，一起看看窗外最远的地方吧');
+  Voice.play(LINES.rest);
   clearInterval(restTimer);
   restTimer = setInterval(() => {
     left--; num.textContent = Math.max(0, left); ring.style.setProperty('--p', (20 - left) / 20);
@@ -986,7 +1066,7 @@ function openStickers() {
     const n = document.createElement('span'); n.className = 'stk-name';
     if (i < u) {
       b.textContent = s[0]; n.textContent = s[1]; b.setAttribute('aria-label', s[1]);
-      b.addEventListener('click', () => { b.classList.remove('wiggle'); void b.offsetWidth; b.classList.add('wiggle'); sfx.boing(); say(s[1]); });
+      b.addEventListener('click', () => { b.classList.remove('wiggle'); void b.offsetWidth; b.classList.add('wiggle'); sfx.boing(); Voice.play(LINES.stickerName(s), s[1], true); });
     } else {
       cell.classList.add('locked'); b.classList.add('locked'); b.textContent = '?'; b.disabled = true;
       n.textContent = `★ ${(i + 1) * PER}`; b.setAttribute('aria-label', `攒到 ${(i + 1) * PER} 颗星解锁`);
@@ -1000,7 +1080,7 @@ function celebrateSticker(list) {
   const s = list[list.length - 1];
   $('#stk-big').textContent = s[0];
   $('#stk-name').textContent = `「${s[1]}」已经贴进贴纸册啦`;
-  openOv('ov-sticker'); sfx.big(); FX.rain(70); say('获得新贴纸，' + s[1]);
+  openOv('ov-sticker'); sfx.big(); FX.rain(70); Voice.play(LINES.stickerGet(s), '获得新贴纸，' + s[1]);
 }
 $('#stk-ok').addEventListener('click', () => closeOv('ov-sticker'));
 
@@ -1043,6 +1123,7 @@ const Snap = (() => {
     each('.win', w => w.classList.remove('is-target'));
     showItem('');
     pips();
+    Voice.prefetch(ANIMALS.map(a => LINES.target(a[1])));
     newRound(true);
   }
   function newRound(first) {
@@ -1055,7 +1136,7 @@ const Snap = (() => {
     each('.win', w => w.classList.add('is-target'));
     showItem(st.target[0]);
     sfx.big();
-    say(`看到${st.target[1]}，就快拍！`);
+    Voice.play(LINES.target(st.target[1]));
     const go = () => {
       each('.win', w => w.classList.remove('is-target'));
       each('.cap', c => { c.textContent = ''; });
@@ -1112,6 +1193,7 @@ const Snap = (() => {
       title: `${name}赢啦！`,
       sub: `${adultName()} ${st.score[0]} : ${st.score[1]} ${kidName()}`,
       stars: 3,
+      voice: LINES.snapWin(adultName(), p === 1),
       speak: `${name}赢啦，${p === 0 ? kidName() + '下次加油' : '真厉害'}`,
       again: () => startGame('snap')
     });
@@ -1167,7 +1249,7 @@ const Memory = (() => {
       grid.appendChild(b);
     });
     layout(); hud();
-    if (!st.coop) say(`${kidName()}先翻`);
+    if (!st.coop) Voice.play(LINES.memFirst(), `${kidName()}先翻牌！`);
   }
   function flip(b) {
     if (!st || !st.alive || st.lock || b.classList.contains('up')) return;
@@ -1197,14 +1279,14 @@ const Memory = (() => {
   function finish() {
     if (st.coop) {
       const good = st.moves <= Math.ceil(st.pairs * 1.8);
-      showResult({ art: '🤝', title: good ? '记性超级棒！' : '全部找到啦！', sub: `一起用 ${st.moves} 次找到了全部 ${st.pairs} 对`, stars: good ? 3 : 2, again: () => startGame('memory') });
+      showResult({ art: '🤝', title: good ? LINES.memGood : LINES.memDone, sub: `一起用 ${st.moves} 次找到了全部 ${st.pairs} 对`, stars: good ? 3 : 2, again: () => startGame('memory') });
       return;
     }
     const [a, k] = st.score;
-    if (a === k) showResult({ art: '🤝', title: '平手！', sub: `${a} : ${k}，两个人一样棒`, stars: 3, again: () => startGame('memory') });
+    if (a === k) showResult({ art: '🤝', title: '平手！', voice: LINES.tie, sub: `${a} : ${k}，两个人一样棒`, stars: 3, again: () => startGame('memory') });
     else {
       const p = a > k ? 0 : 1, name = p === 0 ? adultName() : kidName();
-      showResult({ art: p === 0 ? adultAva() : kidAva(), title: `${name}赢啦！`, sub: `${adultName()} ${a} 对 · ${kidName()} ${k} 对`, stars: 3, again: () => startGame('memory') });
+      showResult({ art: p === 0 ? adultAva() : kidAva(), title: `${name}赢啦！`, voice: LINES.memWin(adultName(), p === 1), sub: `${adultName()} ${a} 对 · ${kidName()} ${k} 对`, stars: 3, again: () => startGame('memory') });
     }
   }
   function stop() { if (st) st.alive = false; }
@@ -1343,7 +1425,7 @@ const Bubble = (() => {
       if (gameId !== 'bubble') return;
       showResult({
         art: stars === 3 ? '🏆' : '🫶',
-        title: stars === 3 ? '默契满分！' : stars === 2 ? '配合得真好！' : '下次一定行！',
+        title: stars === 3 ? LINES.bub3 : stars === 2 ? LINES.bub2 : LINES.bub1,
         sub: `一起戳破 ${c} 个泡泡（目标 ${L.goal}），爱心泡泡 ${st.hearts} 个`,
         stars, again: () => startGame('bubble')
       });
@@ -1416,7 +1498,6 @@ const Cards = (() => {
   let deck = [], idx = -1, cur = null, done = 0, revealed = false, busy = false, tmr = 0, alive = false;
   const fillNames = t => t.replace(/\{K\}/g, kidName()).replace(/\{A\}/g, adultName());
   const whoText = c => c[1] === 0 ? '一起来' : c[1] === 1 ? `${kidName()}来` : `${adultName()}来`;
-  if (!canSpeak) { readBtn.hidden = true; $('.cards-actions').classList.add('no-read'); }
   function setActions(on) { [skipBtn, okBtn, readBtn].forEach(b => { b.disabled = !on; }); }
   function stopTimer() { clearInterval(tmr); tmr = 0; }
   function faceDown() {
@@ -1425,6 +1506,7 @@ const Cards = (() => {
   }
   function start() {
     alive = true; deck = shuffle(CARDS.slice()); idx = -1; done = 0; $('#cards-done').textContent = '0'; busy = false;
+    Voice.prefetch([LINES.card(deck[0], adultName())]);
     faceDown();
   }
   function fill(c) {
@@ -1447,8 +1529,10 @@ const Cards = (() => {
     cur = deck[idx]; fill(cur);
     card.classList.add('up'); sfx.flip(); revealed = true;
     card.setAttribute('aria-label', '挑战：' + fillNames(cur[3]));
-    setTimeout(() => { busy = false; if (alive && revealed) { setActions(true); say(whoText(cur) + '，' + fillNames(cur[3])); } }, 480);
+    Voice.prefetch([LINES.card(deck[(idx + 1) % deck.length], adultName())]);
+    setTimeout(() => { busy = false; if (alive && revealed) { setActions(true); speakCard(false); } }, 480);
   }
+  function speakCard(force) { if (cur) Voice.play(LINES.card(cur, adultName()), whoText(cur) + '，' + fillNames(cur[3]), force); }
   card.addEventListener('click', () => {
     if (!revealed) draw();
     else { card.classList.remove('nudge'); void card.offsetWidth; card.classList.add('nudge'); }
@@ -1466,7 +1550,7 @@ const Cards = (() => {
     hush(); faceDown();
     if (news.length) setTimeout(() => celebrateSticker(news), 500);
   });
-  readBtn.addEventListener('click', () => { if (cur && revealed) say(whoText(cur) + '，' + fillNames(cur[3]), true); });
+  readBtn.addEventListener('click', () => { if (cur && revealed) speakCard(true); });
   timerBtn.addEventListener('click', () => {
     if (!cur || !cur[4] || tmr) return;
     let left = cur[4];
@@ -1474,7 +1558,7 @@ const Cards = (() => {
     tmr = setInterval(() => {
       left--;
       if (left > 0) { timerBtn.textContent = `还剩 ${left} 秒`; if (left <= 3) sfx.beep(); }
-      else { stopTimer(); timerBtn.textContent = '时间到！'; sfx.win(); FX.burstEl(timerBtn, 20); say('时间到'); }
+      else { stopTimer(); timerBtn.textContent = '时间到！'; sfx.win(); FX.burstEl(timerBtn, 20); Voice.play(LINES.timeUp); }
     }, 1000);
   });
   function stop() { alive = false; stopTimer(); hush(); }
@@ -1485,6 +1569,7 @@ const MODULES = { snap: Snap, memory: Memory, bubble: Bubble, cards: Cards };
 
 /* ============ 启动 ============ */
 function boot(data) {
+  Voice.load();
   renderHome();
   if (data && data.screen === 'stickers') openStickers(); else show('home');
 }
